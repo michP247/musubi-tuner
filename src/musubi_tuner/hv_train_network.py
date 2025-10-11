@@ -105,9 +105,6 @@ class collator_class:
 
 
 def prepare_accelerator(args: argparse.Namespace) -> Accelerator:
-    """
-    DeepSpeed is not supported in this script currently.
-    """
     if args.logging_dir is None:
         logging_dir = None
     else:
@@ -136,6 +133,16 @@ def prepare_accelerator(args: argparse.Namespace) -> Accelerator:
                 os.environ["WANDB_DIR"] = logging_dir
             if args.wandb_api_key is not None:
                 wandb.login(key=args.wandb_api_key)
+
+    deepspeed_plugin = None
+    if hasattr(args, 'deepspeed') and args.deepspeed:
+        from musubi_tuner.utils import deepspeed_utils
+        logger.info("DeepSpeed is enabled. Preparing DeepSpeed plugin.")
+        # We need train_batch_size for the plugin config, let's get it.
+        # This is a bit of a hack since the dataset isn't loaded yet. We assume a default or it's in the args.
+        if not hasattr(args, 'train_batch_size'):
+            args.train_batch_size = 1 # A reasonable default if not specified
+        deepspeed_plugin = deepspeed_utils.prepare_deepspeed_plugin(args)
 
     kwargs_handlers = [
         (
@@ -175,6 +182,7 @@ def prepare_accelerator(args: argparse.Namespace) -> Accelerator:
         project_dir=logging_dir,
         dynamo_plugin=dynamo_plugin,
         kwargs_handlers=kwargs_handlers,
+        deepspeed_plugin=deepspeed_plugin,
     )
     print("accelerator device:", accelerator.device)
     return accelerator
@@ -507,6 +515,16 @@ class NetworkTrainer:
         elif optimizer_type == "AdamW".lower():
             logger.info(f"use AdamW optimizer | {optimizer_kwargs}")
             optimizer_class = torch.optim.AdamW
+            optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+
+        elif optimizer_type == "DeepSpeedCPUAdam".lower() or optimizer_type == "CPUAdam".lower():
+            try:
+                import deepspeed
+            except ImportError:
+                raise ImportError("DeepSpeed is not installed. Install with: pip install deepspeed")
+
+            logger.info(f"use DeepSpeed CPUAdam optimizer (offloads optimizer states to CPU RAM) | {optimizer_kwargs}")
+            optimizer_class = deepspeed.ops.adam.DeepSpeedCPUAdam
             optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
         if optimizer is None:
@@ -1607,6 +1625,152 @@ class NetworkTrainer:
 
     # endregion model specific
 
+    def print_nfn_results(self, sorted_results, accelerator):
+        accelerator.print("\n" + "="*60)
+        accelerator.print("NFN Score Results per Block")
+        accelerator.print("="*60)
+        accelerator.print(f"{ 'Block':<15} | { 'NFN Score':<15} | { 'Module Count':<15}")
+        accelerator.print("-" * 60)
+
+        for block_name, data in sorted_results.items():
+            nfn_score = data.get('nfn', 0.0)
+            module_count = data.get('module_count', 0)
+            accelerator.print(f"{block_name:<15} | {nfn_score:<15.4f} | {module_count:<15}")
+
+        accelerator.print("=" * 60)
+
+    def generate_recommended_weights(self, sorted_results, args, accelerator):
+        accelerator.print("\n" + "="*60)
+        accelerator.print("Recommended --network_block_lr_weights")
+        accelerator.print("="*60)
+
+        valid_scores = [v['nfn'] for k, v in sorted_results.items() if v.get('module_count', 0) > 0 and k != "other"]
+        if not valid_scores:
+            accelerator.print("No valid NFN scores found. Cannot generate weights.")
+            return
+
+        min_score, max_score = min(valid_scores), max(valid_scores)
+        score_range = max_score - min_score if max_score > min_score else 1.0
+
+        accelerator.print(f"NFN Score Range: Min={min_score:.4f}, Max={max_score:.4f}")
+        accelerator.print(f"Weighting Range: Min LR Weight={args.nfn_min_lr_weight}, Max LR Weight={args.nfn_max_lr_weight}")
+
+        def nfn_to_weight(nfn_score, module_count):
+            if module_count == 0: return 0.0
+            inverted_score = 1.0 - ((nfn_score - min_score) / score_range)
+            weight_range = args.nfn_max_lr_weight - args.nfn_min_lr_weight
+            return (inverted_score * weight_range) + args.nfn_min_lr_weight
+
+        weights = []
+        # Ensure blocks are sorted numerically
+        sorted_keys = sorted(sorted_results.keys(), key=lambda x: int(x.split('_')[1]) if x.startswith('block_') else float('inf'))
+
+        for block_name in sorted_keys:
+            if block_name == "other": continue
+            data = sorted_results[block_name]
+            weight = nfn_to_weight(data.get('nfn', 0.0), data.get('module_count', 0))
+            weights.append(f"{weight:.4f}")
+
+        accelerator.print("\nCopy and paste these into your training arguments:")
+        accelerator.print(f'--network_block_lr_weights {" ".join(weights)}')
+        accelerator.print("\n" + "="*60 + "\n")
+
+    def calculate_and_show_nfn_scores(self, args, accelerator, unet, vae, train_dataloader, noise_scheduler):
+        from collections import defaultdict
+        from musubi_tuner.utils import metrics as metrics_utils
+
+        accelerator.print("\n" + "="*80)
+        accelerator.print("Starting NFN Score Calculation")
+        accelerator.print("="*80)
+
+        unet.eval()
+
+        all_metrics_from_all_batches = []
+
+        metrics_for_single_batch = defaultdict(dict)
+        hooks = metrics_utils.attach_nfn_hooks(unet, metrics_for_single_batch)
+
+        if not hooks:
+            accelerator.print("Could not attach any hooks. Aborting NFN analysis.")
+            return
+        accelerator.print(f"[INFO] Attached {len(hooks)} hooks to U-Net modules.")
+
+        num_batches_to_process = len(train_dataloader)
+        accelerator.print(f"Analyzing {num_batches_to_process} batches from your dataset...")
+
+        progress_bar = tqdm(
+            range(num_batches_to_process),
+            smoothing=0,
+            disable=not accelerator.is_local_main_process,
+            desc="NFN Analysis",
+        )
+        data_iter = iter(train_dataloader)
+
+        for i in range(num_batches_to_process):
+            try:
+                batch = next(data_iter)
+            except StopIteration:
+                accelerator.print(f"Dataset exhausted after {i} batches.")
+                break
+
+            with torch.no_grad():
+                latents = batch["latents"].to(accelerator.device)
+                noise = torch.randn_like(latents)
+                noisy_model_input, timesteps = self.get_noisy_model_input_and_timesteps(
+                    args, noise, latents, None, noise_scheduler, accelerator.device, unet.dtype
+                )
+
+                self.call_dit(args, accelerator, unet, latents, batch, noise, noisy_model_input, timesteps, unet.dtype)
+
+                all_metrics_from_all_batches.append(dict(metrics_for_single_batch))
+                metrics_for_single_batch.clear()
+
+            progress_bar.update(1)
+
+        metrics_utils.remove_nfn_hooks(hooks)
+        progress_bar.close()
+
+        if not all_metrics_from_all_batches:
+            accelerator.print("No metrics were calculated.")
+            return
+
+        avg_metrics = metrics_utils.average_metrics(all_metrics_from_all_batches)
+
+        def get_block_name(module_name):
+            if "transformer_blocks" in module_name: # Qwen
+                match = re.search(r"transformer_blocks\.(\d+)\.", module_name)
+                if match:
+                    return f"block_{int(match.group(1)):02d}"
+            elif "blocks" in module_name: # Wan
+                match = re.search(r"blocks\.(\d+)\.", module_name)
+                if match:
+                    return f"block_{int(match.group(1)):02d}"
+            return "other"
+
+        if hasattr(unet, 'num_layers'): # For WanModel
+            num_blocks = unet.num_layers
+        elif hasattr(unet, 'transformer_blocks'): # For QwenImageTransformer2DModel
+            num_blocks = len(unet.transformer_blocks)
+        else:
+            num_blocks = 0
+
+        expected_blocks = [f"block_{i:02d}" for i in range(num_blocks)] + ["other"]
+        block_scores = {block: {'nfn_sum': 0.0, 'count': 0} for block in expected_blocks}
+
+        for module_name, values in avg_metrics.items():
+            block_name = get_block_name(module_name)
+            if block_name in block_scores:
+                block_scores[block_name]['nfn_sum'] += values.get('nfn', 1.0)
+                block_scores[block_name]['count'] += 1
+
+        final_results = {block: {'nfn': data['nfn_sum'] / data['count'] if data['count'] > 0 else 0.0, 'module_count': data['count']} for block, data in block_scores.items()}
+
+        sorted_results = dict(sorted(final_results.items()))
+
+        #self.print_nfn_results(sorted_results, accelerator)
+
+        self.generate_recommended_weights(sorted_results, args, accelerator)
+
     def train(self, args):
         # check required arguments
         if args.dataset_config is None:
@@ -1791,6 +1955,10 @@ class NetworkTrainer:
         # apply network to DiT
         network.apply_to(None, transformer, apply_text_encoder=False, apply_unet=True)
 
+        # Cast network to match transformer dtype to avoid dtype mismatches during gradient checkpointing
+        logger.info(f"Casting network to {dit_dtype} to match transformer dtype")
+        network.to(dit_dtype)
+
         if args.network_weights is not None:
             # FIXME consider alpha of weights: this assumes that the alpha is not changed
             info = network.load_weights(args.network_weights)
@@ -1803,7 +1971,7 @@ class NetworkTrainer:
         # prepare optimizer, data loader etc.
         accelerator.print("prepare optimizer, data loader etc.")
 
-        trainable_params, lr_descriptions = network.prepare_optimizer_params(unet_lr=args.learning_rate)
+        trainable_params, lr_descriptions = network.prepare_optimizer_params(transformer, unet_lr=args.learning_rate)
         optimizer_name, optimizer_args, optimizer, optimizer_train_fn, optimizer_eval_fn = self.get_optimizer(
             args, trainable_params
         )
@@ -1861,10 +2029,19 @@ class NetworkTrainer:
             logger.info(f"casting model to {dit_weight_dtype}")
             transformer.to(dit_weight_dtype)
 
+        # Check if using DeepSpeed
+        using_deepspeed = accelerator.state.distributed_type == accelerate.DistributedType.DEEPSPEED
+
         if blocks_to_swap > 0:
-            transformer = accelerator.prepare(transformer, device_placement=[not blocks_to_swap > 0])
-            accelerator.unwrap_model(transformer).move_to_device_except_swap_blocks(accelerator.device)  # reduce peak memory usage
-            accelerator.unwrap_model(transformer).prepare_block_swap_before_forward()
+            if using_deepspeed:
+                logger.warning("blocks_to_swap is not compatible with DeepSpeed, disabling block swapping")
+                blocks_to_swap = 0
+                self.blocks_to_swap = 0
+                transformer = accelerator.prepare(transformer)
+            else:
+                transformer = accelerator.prepare(transformer, device_placement=[not blocks_to_swap > 0])
+                accelerator.unwrap_model(transformer).move_to_device_except_swap_blocks(accelerator.device)  # reduce peak memory usage
+                accelerator.unwrap_model(transformer).prepare_block_swap_before_forward()
         else:
             transformer = accelerator.prepare(transformer)
 

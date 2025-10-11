@@ -268,8 +268,8 @@ class QwenEmbedRope(nn.Module):
         super().__init__()
         self.theta = theta
         self.axes_dim = axes_dim
-        pos_index = torch.arange(4096)
-        neg_index = torch.arange(4096).flip(0) * -1 - 1
+        pos_index = torch.arange(1024)
+        neg_index = torch.arange(1024).flip(0) * -1 - 1
         self.pos_freqs = torch.cat(
             [
                 self.rope_params(pos_index, self.axes_dim[0], self.theta),
@@ -288,7 +288,7 @@ class QwenEmbedRope(nn.Module):
         )
         self.rope_cache = {}
 
-        # DO NOT USE REGISTER BUFFER HERE, IT WILL CAUSE COMPLEX NUMBERS TO LOSE THEIR IMAGINARY PART
+        # 是否使用 scale rope
         self.scale_rope = scale_rope
 
     def rope_params(self, index, dim, theta=10000):
@@ -310,52 +310,39 @@ class QwenEmbedRope(nn.Module):
             self.pos_freqs = self.pos_freqs.to(device)
             self.neg_freqs = self.neg_freqs.to(device)
 
-        if isinstance(video_fhw, list):  # if list of lists
+        if isinstance(video_fhw, list):
             video_fhw = video_fhw[0]
-        if not isinstance(video_fhw, list):  # if video_fhw is tuple
-            video_fhw = [video_fhw]
+        frame, height, width = video_fhw
+        rope_key = f"{frame}_{height}_{width}"
 
-        vid_freqs = []
-        max_vid_index = 0
-        for idx, fhw in enumerate(video_fhw):
-            frame, height, width = fhw
-            rope_key = f"{idx}_{height}_{width}"
-
-            if rope_key not in self.rope_cache:
-                self.rope_cache[rope_key] = self._compute_video_freqs(frame, height, width, idx)
-            video_freq = self.rope_cache[rope_key]
-            video_freq = video_freq.to(device)
-            vid_freqs.append(video_freq)
-
+        if rope_key not in self.rope_cache:
+            seq_lens = frame * height * width
+            freqs_pos = self.pos_freqs.split([x // 2 for x in self.axes_dim], dim=1)
+            freqs_neg = self.neg_freqs.split([x // 2 for x in self.axes_dim], dim=1)
+            freqs_frame = freqs_pos[0][:frame].view(frame, 1, 1, -1).expand(frame, height, width, -1)
             if self.scale_rope:
-                max_vid_index = max(height // 2, width // 2, max_vid_index)
+                freqs_height = torch.cat([freqs_neg[1][-(height - height // 2) :], freqs_pos[1][: height // 2]], dim=0)
+                freqs_height = freqs_height.view(1, height, 1, -1).expand(frame, height, width, -1)
+                freqs_width = torch.cat([freqs_neg[2][-(width - width // 2) :], freqs_pos[2][: width // 2]], dim=0)
+                freqs_width = freqs_width.view(1, 1, width, -1).expand(frame, height, width, -1)
+
             else:
-                max_vid_index = max(height, width, max_vid_index)
+                freqs_height = freqs_pos[1][:height].view(1, height, 1, -1).expand(frame, height, width, -1)
+                freqs_width = freqs_pos[2][:width].view(1, 1, width, -1).expand(frame, height, width, -1)
+
+            freqs = torch.cat([freqs_frame, freqs_height, freqs_width], dim=-1).reshape(seq_lens, -1)
+            self.rope_cache[rope_key] = freqs.clone().contiguous()
+        vid_freqs = self.rope_cache[rope_key]
+
+        if self.scale_rope:
+            max_vid_index = max(height // 2, width // 2)
+        else:
+            max_vid_index = max(height, width)
 
         max_len = max(txt_seq_lens)
         txt_freqs = self.pos_freqs[max_vid_index : max_vid_index + max_len, ...]
-        vid_freqs = torch.cat(vid_freqs, dim=0)
 
         return vid_freqs, txt_freqs
-
-    # @functools.lru_cache(maxsize=None)
-    def _compute_video_freqs(self, frame, height, width, idx=0):
-        seq_lens = frame * height * width
-        freqs_pos = self.pos_freqs.split([x // 2 for x in self.axes_dim], dim=1)
-        freqs_neg = self.neg_freqs.split([x // 2 for x in self.axes_dim], dim=1)
-
-        freqs_frame = freqs_pos[0][idx : idx + frame].view(frame, 1, 1, -1).expand(frame, height, width, -1)
-        if self.scale_rope:
-            freqs_height = torch.cat([freqs_neg[1][-(height - height // 2) :], freqs_pos[1][: height // 2]], dim=0)
-            freqs_height = freqs_height.view(1, height, 1, -1).expand(frame, height, width, -1)
-            freqs_width = torch.cat([freqs_neg[2][-(width - width // 2) :], freqs_pos[2][: width // 2]], dim=0)
-            freqs_width = freqs_width.view(1, 1, width, -1).expand(frame, height, width, -1)
-        else:
-            freqs_height = freqs_pos[1][:height].view(1, height, 1, -1).expand(frame, height, width, -1)
-            freqs_width = freqs_pos[2][:width].view(1, 1, width, -1).expand(frame, height, width, -1)
-
-        freqs = torch.cat([freqs_frame, freqs_height, freqs_width], dim=-1).reshape(seq_lens, -1)
-        return freqs.clone().contiguous()
 
 
 class RMSNorm(nn.Module):
@@ -1066,7 +1053,11 @@ class QwenImageTransformer2DModel(nn.Module):  # ModelMixin, ConfigMixin, PeftAd
         self.offloader.prepare_block_devices_before_forward(self.transformer_blocks)
 
     def _gradient_checkpointing_func(self, block, *args):
-        return torch.utils.checkpoint.checkpoint(block, *args, use_reentrant=False)
+        try:
+            import deepspeed
+            return deepspeed.checkpointing.checkpoint(block, *args)
+        except ImportError:
+            return torch.utils.checkpoint.checkpoint(block, *args, use_reentrant=False)
 
     def forward(
         self,
@@ -1198,6 +1189,7 @@ def load_qwen_image_model(
     fp8_scaled: bool = False,
     lora_weights_list: Optional[Dict[str, torch.Tensor]] = None,
     lora_multipliers: Optional[List[float]] = None,
+    load_weights: bool = True,
 ) -> QwenImageTransformer2DModel:
     """
     Load a WAN model from the specified checkpoint.
@@ -1213,6 +1205,7 @@ def load_qwen_image_model(
         fp8_scaled (bool): Whether to use fp8 scaling for the model weights.
         lora_weights_list (Optional[Dict[str, torch.Tensor]]): LoRA weights to apply, if any.
         lora_multipliers (Optional[List[float]]): LoRA multipliers for the weights, if any.
+        load_weights (bool): Whether to load weights into the model. If False, creates a hollow model (for DeepSpeed Stage 3).
     """
     # dit_weight_dtype is None for fp8_scaled
     assert (not fp8_scaled and dit_weight_dtype is not None) or (fp8_scaled and dit_weight_dtype is None)
@@ -1220,28 +1213,29 @@ def load_qwen_image_model(
     device = torch.device(device)
     loading_device = torch.device(loading_device)
 
-    with init_empty_weights():
-        logger.info(f"Creating QwenImageTransformer2DModel")
-        """
-        {
-            "_class_name": "QwenImageTransformer2DModel",
-            "_diffusers_version": "0.34.0.dev0",
-            "attention_head_dim": 128,
-            "axes_dims_rope": [
-                16,
-                56,
-                56
-            ],
-            "guidance_embeds": false,
-            "in_channels": 64,
-            "joint_attention_dim": 3584,
-            "num_attention_heads": 24,
-            "num_layers": 60,
-            "out_channels": 16,
-            "patch_size": 2,
-            "pooled_projection_dim": 768
-        }
-        """
+    logger.info(f"Creating QwenImageTransformer2DModel")
+
+    # When load_weights=False, we're inside DeepSpeed zero.Init() context, so skip init_empty_weights
+    # When load_weights=True, use init_empty_weights to avoid RAM exhaustion during normal loading
+    if load_weights:
+        # Normal training: use init_empty_weights to create model on meta device first
+        # Don't call .to() on meta tensors - dtype will be set during load_state_dict
+        with init_empty_weights():
+            model = QwenImageTransformer2DModel(
+                patch_size=2,
+                in_channels=64,
+                out_channels=16,
+                num_layers=60,
+                attention_head_dim=128,
+                num_attention_heads=24,
+                joint_attention_dim=3584,
+                guidance_embeds=False,
+                axes_dims_rope=(16, 56, 56),
+                attn_mode=attn_mode,
+                split_attn=split_attn,
+            )
+    else:
+        # DeepSpeed hollow model: create directly (already inside zero.Init() context)
         model = QwenImageTransformer2DModel(
             patch_size=2,
             in_channels=64,
@@ -1255,8 +1249,8 @@ def load_qwen_image_model(
             attn_mode=attn_mode,
             split_attn=split_attn,
         )
-        if dit_weight_dtype is not None:
-            model.to(dit_weight_dtype)
+        logger.info("Returning hollow QwenImageTransformer2DModel without loading weights.")
+        return model
 
     # load model weights with dynamic fp8 optimization and LoRA merging if needed
     logger.info(f"Loading DiT model from {dit_path}, device={loading_device}")

@@ -343,7 +343,7 @@ def create_network(
     neuron_dropout: Optional[float] = None,
     **kwargs,
 ):
-    """architecture independent network creation"""
+    """ architecture independent network creation """
     if network_dim is None:
         network_dim = 4  # default
     if network_alpha is None:
@@ -698,12 +698,65 @@ class LoRANetwork(torch.nn.Module):
         logger.info(f"LoRA+ UNet LR Ratio: {self.loraplus_lr_ratio}")
         # logger.info(f"LoRA+ Text Encoder LR Ratio: {self.loraplus_text_encoder_lr_ratio or self.loraplus_lr_ratio}")
 
-    def prepare_optimizer_params(self, unet_lr: float = 1e-4, **kwargs):
+    def prepare_optimizer_params(self, unet, unet_lr: float = 1e-4, block_lr_weights=None, **kwargs):
         self.requires_grad_(True)
 
         all_params = []
         lr_descriptions = []
 
+        if block_lr_weights is not None:
+            # Determine the number of blocks from the unet model
+            if hasattr(unet, "num_layers"):  # For WanModel
+                num_blocks = unet.num_layers
+                block_prefix = "lora_unet_blocks_"
+                block_index_offset = 3
+            elif hasattr(unet, "transformer_blocks"):  # For QwenImageTransformer2DModel
+                num_blocks = len(unet.transformer_blocks)
+                block_prefix = "lora_unet_transformer_blocks_"
+                block_index_offset = 4
+            else:
+                raise ValueError("Cannot determine number of blocks for the unet model")
+
+            num_lr_weights = len(block_lr_weights)
+            logger.info(f"Using {num_lr_weights} learning rate weights for {num_blocks} blocks.")
+
+            block_params = [[] for _ in range(num_lr_weights)]
+            other_params = []
+
+            for lora_module in self.unet_loras:
+                try:
+                    if lora_module.lora_name.startswith(block_prefix):
+                        block_index_str = lora_module.lora_name.split("_")[block_index_offset]
+                        block_index = int(block_index_str)
+                        if 0 <= block_index < num_blocks:
+                            # map block_index to weight_index
+                            weight_index = min(block_index * num_lr_weights // num_blocks, num_lr_weights - 1)
+                            block_params[weight_index].extend(lora_module.parameters())
+                        else:
+                            other_params.extend(lora_module.parameters())
+                    else:
+                        other_params.extend(lora_module.parameters())
+                except (IndexError, ValueError):
+                    other_params.extend(lora_module.parameters())
+
+            for i in range(num_lr_weights):
+                if not block_params[i]:
+                    continue
+                block_lr = unet_lr * block_lr_weights[i]
+                all_params.append({"params": block_params[i], "lr": block_lr})
+                start_block = (i * num_blocks) // num_lr_weights
+                end_block = ((i + 1) * num_blocks) // num_lr_weights - 1
+                if i == num_lr_weights - 1:
+                    end_block = num_blocks - 1
+                lr_descriptions.append(f"blocks_{start_block}-{end_block} (lr={block_lr})")
+
+            if other_params:
+                all_params.append({"params": other_params, "lr": unet_lr})
+                lr_descriptions.append(f"other (lr={unet_lr})")
+
+            return all_params, lr_descriptions
+
+        # Original logic if block_lr_weights is not provided
         def assemble_params(loras, lr, loraplus_ratio):
             param_groups = {"lora": {}, "plus": {}}
             for lora in loras:
@@ -716,7 +769,7 @@ class LoRANetwork(torch.nn.Module):
             params = []
             descriptions = []
             for key in param_groups.keys():
-                param_data = {"params": param_groups[key].values()}
+                param_data = {"params": list(param_groups[key].values())}
 
                 if len(param_data["params"]) == 0:
                     continue
