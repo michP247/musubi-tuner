@@ -100,9 +100,38 @@ def main():
 
     # Load Qwen2.5-VL
     logger.info(f"Loading Qwen2.5-VL: {args.text_encoder}")
-    tokenizer, text_encoder = qwen_image_utils.load_qwen2_5_vl(
-        ckpt_path=args.text_encoder, dtype=vl_dtype, device=device, disable_mmap=True
-    )
+    # Optional accelerate device_map sharding to avoid OOM
+    vl_device_map = os.environ.get("QWEN_VL_DEVICE_MAP", None)
+    if hasattr(args, "vl_device_map") and args.vl_device_map:
+        vl_device_map = args.vl_device_map
+
+    if vl_device_map:
+        logger.info(f"Using manual device_map for Qwen2.5-VL: {vl_device_map}")
+        # Load model weights on CPU, then move only the language model to CUDA to avoid OOM
+        tokenizer, text_encoder = qwen_image_utils.load_qwen2_5_vl(
+            ckpt_path=args.text_encoder, dtype=vl_dtype, device=torch.device("cpu"), disable_mmap=True
+        )
+        try:
+            lm = getattr(getattr(text_encoder, "model"), "language_model", None)
+            visual = getattr(getattr(text_encoder, "model"), "visual", None)
+            if torch.cuda.is_available() and lm is not None:
+                logger.info("Moving Qwen-VL language_model to CUDA; keeping visual tower on CPU")
+                lm.to("cuda", dtype=vl_dtype)
+            else:
+                logger.info("CUDA not available or language_model missing; staying on CPU")
+        except Exception as e:
+            logger.warning(f"Manual device placement failed ({e}); falling back to CPU-only for Qwen-VL")
+            # Keep full model on CPU to avoid OOM; adjust downstream device usage
+            device = torch.device("cpu")
+            accelerator = None
+            try:
+                text_encoder.to(device)
+            except Exception:
+                pass
+    else:
+        tokenizer, text_encoder = qwen_image_utils.load_qwen2_5_vl(
+            ckpt_path=args.text_encoder, dtype=vl_dtype, device=device, disable_mmap=True
+        )
 
     # Load Qwen2VLProcessor
     if is_edit:
@@ -140,6 +169,7 @@ def qwen_image_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argumen
     parser.add_argument("--text_encoder", type=str, default=None, required=True, help="Text Encoder (Qwen2.5-VL) checkpoint path")
     parser.add_argument("--fp8_vl", action="store_true", help="use fp8 for Text Encoder model")
     parser.add_argument("--edit", action="store_true", help="cache Text Encoder outputs for Qwen-Image-Edit")
+    parser.add_argument("--vl_device_map", type=str, default=None, help="accelerate device_map for Qwen-VL (e.g., 'auto' or 'lm_cuda')")
     return parser
 
 

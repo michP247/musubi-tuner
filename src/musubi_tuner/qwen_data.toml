@@ -1,0 +1,39 @@
+[general]
+caption_extension = ".txt"
+enable_bucket = false
+bucket_no_upscale = false
+batch_size = 1
+
+[[datasets]]
+resolution = [1024, 1024]
+image_directory = "/home/en1u2/AI-Stuff/References/1024"
+
+[[datasets]]
+resolution = [1216, 832]
+image_directory = "/home/en1u2/AI-Stuff/References/1216x832"
+
+[[datasets]]
+resolution = [832, 1216]
+image_directory = "/home/en1u2/AI-Stuff/References/832x1216"
+
+[[datasets]]
+resolution = [896, 1152]
+image_directory = "/home/en1u2/AI-Stuff/References/896x1152"
+
+[[datasets]]
+resolution = [1152, 896]
+image_directory = "/home/en1u2/AI-Stuff/References/1152x896"
+
+# [[datasets]]
+# resolution = [768, 768]
+# image_directory = "/home/en1u2/AI-Stuff/References/768"
+#
+# [[datasets]]
+# resolution = [512, 512]
+# image_directory = "/home/en1u2/AI-Stuff/References/512"
+
+
+#  [[datasets.subsets]]
+#  image_dir = "/home/en1u2/AI-Stuff/kohya_ss/outputs/reg/woman"
+#  num_repeats = 1
+#  is_reg = true

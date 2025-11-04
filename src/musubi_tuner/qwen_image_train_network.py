@@ -59,7 +59,11 @@ class QwenImageNetworkTrainer(NetworkTrainer):
         from multiprocessing import Value
         import os
 
-        # Set train_batch_size for DeepSpeed plugin (default to 1 for NFN calculation)
+        # Force-disable DeepSpeed for NFN calculation and use innate block swapping
+        if getattr(args, 'deepspeed', False):
+            logger.info("Bypassing DeepSpeed for NFN calculation (will use block swapping instead)")
+            args.deepspeed = False
+            self.is_deepspeed = False
         if not hasattr(args, 'train_batch_size'):
             args.train_batch_size = 1
 
@@ -112,16 +116,10 @@ class QwenImageNetworkTrainer(NetworkTrainer):
 
         dit_weight_dtype = (None if args.fp8_scaled else torch.float8_e4m3fn) if args.fp8_base else self.dit_dtype
 
-        # For NFN calculation with DeepSpeed, ignore blocks_to_swap and let DeepSpeed handle memory
-        using_deepspeed = hasattr(args, 'deepspeed') and args.deepspeed
-
-        if using_deepspeed:
-            logger.info("DeepSpeed enabled for NFN calculation. Block swapping will be disabled.")
-            blocks_to_swap = 0
-            loading_device = accelerator.device
-        else:
-            blocks_to_swap = args.blocks_to_swap if args.blocks_to_swap else 0
-            loading_device = "cpu" if blocks_to_swap > 0 else accelerator.device
+        # Use innate block swapping by default for NFN (bypass DeepSpeed), swap 55 blocks unless specified
+        blocks_to_swap = getattr(args, 'blocks_to_swap', 55) or 55
+        logger.info(f"enable swap {blocks_to_swap} blocks for NFN calculation")
+        loading_device = "cpu" if blocks_to_swap > 0 else accelerator.device
 
         self.blocks_to_swap = blocks_to_swap
 
@@ -129,22 +127,40 @@ class QwenImageNetworkTrainer(NetworkTrainer):
             accelerator, args, args.dit, attn_mode, args.split_attn, loading_device, dit_weight_dtype
         )
 
+        # If FP8 weights are loaded, apply FP8 monkey patch so Linear ops run without CUDA addmm on float8
+        if dit_weight_dtype is not None and dit_weight_dtype == torch.float8_e4m3fn:
+            try:
+                from musubi_tuner.modules.fp8_optimization_utils import apply_fp8_monkey_patch
+                logger.info("Applying FP8 monkey patch for NFN evaluation")
+                # Build a minimal optimized_state_dict with scale keys for FP8 Linear layers
+                fake_opt_sd = {}
+                for name, module in transformer.named_modules():
+                    try:
+                        if isinstance(module, torch.nn.Linear) and getattr(module, 'weight', None) is not None:
+                            if module.weight.dtype == torch.float8_e4m3fn:
+                                fake_opt_sd[f"{name}.scale_weight"] = torch.tensor([1.0])
+                    except Exception:
+                        pass
+                apply_fp8_monkey_patch(transformer, fake_opt_sd, use_scaled_mm=False)
+            except Exception as e:
+                logger.warning(f"FP8 monkey patch failed ({e}); NFN may error on addmm_cuda for float8")
+
         # Convert to bfloat16 for NFN calculation if loaded in FP8
         # FP8 doesn't support all operations needed for gradient calculation
         # Do this BEFORE device movement to avoid dtype/device mismatch
-        target_dtype = torch.bfloat16
+        """ target_dtype = torch.bfloat16
         if dit_weight_dtype is not None and dit_weight_dtype == torch.float8_e4m3fn:
             logger.info(f"Converting model from {dit_weight_dtype} to {target_dtype} for NFN calculation")
             transformer.to(dtype=target_dtype)
         elif transformer.dtype != target_dtype:
             logger.info(f"Converting model from {transformer.dtype} to {target_dtype} for NFN calculation")
-            transformer.to(dtype=target_dtype)
+            transformer.to(dtype=target_dtype) """
 
         transformer.requires_grad_(False)
         transformer.eval()
 
         # For DeepSpeed Stage 3, we need a parameter to optimize and use accelerator.prepare
-        if using_deepspeed:
+        """ if using_deepspeed:
             from accelerate.utils import DummyOptim
 
             # Deepspeed needs a parameter to optimize, so we set requires_grad=True for a small parameter
@@ -160,8 +176,8 @@ class QwenImageNetworkTrainer(NetworkTrainer):
             trainable_param.requires_grad = True
 
             dummy_optimizer = DummyOptim([trainable_param])
-            transformer, dummy_optimizer = accelerator.prepare(transformer, dummy_optimizer)
-        elif blocks_to_swap > 0:
+            transformer, dummy_optimizer = accelerator.prepare(transformer, dummy_optimizer) """
+        if blocks_to_swap > 0:
             logger.info(f"enable swap {blocks_to_swap} blocks for NFN calculation")
             transformer.enable_block_swap(blocks_to_swap, accelerator.device, supports_backward=True)
             transformer.move_to_device_except_swap_blocks(accelerator.device)
@@ -546,8 +562,10 @@ class QwenImageNetworkTrainer(NetworkTrainer):
             vl_embed.requires_grad_(True)
 
         # call DiT
-        noisy_model_input = noisy_model_input.to(device=accelerator.device, dtype=network_dtype)
-        vl_embed = vl_embed.to(device=accelerator.device, dtype=network_dtype)
+        # Use the transformer's dtype for inputs to avoid dtype mismatches with DeepSpeed
+        model_dtype = model.dtype if hasattr(model, 'dtype') else torch.bfloat16
+        noisy_model_input = noisy_model_input.to(device=accelerator.device, dtype=model_dtype)
+        vl_embed = vl_embed.to(device=accelerator.device, dtype=model_dtype)
         if vl_mask is not None:
             vl_mask = vl_mask.to(device=accelerator.device)  # bool
 
@@ -615,6 +633,14 @@ def qwen_image_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argumen
         help="Maximum learning rate weight for NFN. Default is 2.",
     )
     parser.add_argument("--network_block_lr_weights", type=float, nargs="*", help="learning rate weights for each block in the network")
+    # NFN preset builder options (mirror SDXL builder)
+    parser.add_argument("--nfn_preset_output", type=str, default=None, help="save a LoRA preset TOML calibrated from NFN scores at this path")
+    parser.add_argument("--preset_base_attn", type=int, default=48)
+    parser.add_argument("--preset_base_mlp", type=int, default=40)
+    parser.add_argument("--preset_min_rank", type=int, default=24)
+    parser.add_argument("--preset_max_rank", type=int, default=96)
+    parser.add_argument("--preset_gamma", type=float, default=1.0)
+    parser.add_argument("--preset_scope", type=str, default="attn-mlp", choices=["full","full-lin","attn-mlp","attn-only","unet-transformer-only"])
 
     parser.add_argument(
         "--auto_balance_reg_datasets",

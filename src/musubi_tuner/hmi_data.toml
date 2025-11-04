@@ -1,31 +1,64 @@
- [general]
-resolution = [768, 768]
-batch_size = 1
-caption_extension = ".txt"
-enable_bucket = true
+[general]
+flip_aug = false
+shuffle_caption = false
+caption_extension = ""
+enable_bucket = false
 bucket_no_upscale = false
+max_bucket_reso = 2048
+batch_size = 1
 
 [[datasets]]
-image_directory = "/home/en1u2/AI-Stuff/References/regular"
-num_repeats = 1
+resolution = [1024, 1024]
+
+  [[datasets.subsets]]
+  image_dir = "/home/en1u2/AI-Stuff/References/1024"
+  num_repeats = 1
+
+# [[datasets]]
+# resolution = [768, 768]
+#
+#   [[datasets.subsets]]
+#   image_dir = "/home/en1u2/AI-Stuff/References/768"
+#   num_repeats = 1
+#
+# [[datasets]]
+# resolution = [512, 512]
+#
+#   [[datasets.subsets]]
+#   image_dir = "/home/en1u2/AI-Stuff/References/512"
+#   num_repeats = 1
 
 [[datasets]]
-image_directory = "/home/en1u2/AI-Stuff/References/water"
-num_repeats = 1
+resolution = [1216, 832]
+
+  [[datasets.subsets]]
+  image_dir = "/home/en1u2/AI-Stuff/References/1216x832"
+  num_repeats = 1
 
 [[datasets]]
-image_directory = "/home/en1u2/AI-Stuff/References/dark"
-num_repeats = 1
+resolution = [832, 1216]
+
+  [[datasets.subsets]]
+  image_dir = "/home/en1u2/AI-Stuff/References/832x1216"
+  num_repeats = 1
 
 [[datasets]]
-image_directory = "/home/en1u2/AI-Stuff/References/sketch"
-num_repeats = 1
+resolution = [896, 1152]
+
+  [[datasets.subsets]]
+  image_dir = "/home/en1u2/AI-Stuff/References/896x1152"
+  num_repeats = 1
 
 [[datasets]]
-image_directory = "/home/en1u2/AI-Stuff/References/anime_new"
-num_repeats = 1
+resolution = [1152, 896]
 
-#[[datasets]]
-#image_directory = "/home/en1u2/AI-Stuff/kohya_ss/outputs/reg/woman"
-#num_repeats = 1
-#is_reg = true
+  [[datasets.subsets]]
+  image_dir = "/home/en1u2/AI-Stuff/References/1152x896"
+  num_repeats = 1
+
+
+
+#  [[datasets.subsets]]
+#  image_dir = "/home/en1u2/AI-Stuff/kohya_ss/outputs/reg/woman"
+#  num_repeats = 1
+#  is_reg = true

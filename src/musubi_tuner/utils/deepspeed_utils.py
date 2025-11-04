@@ -139,18 +139,19 @@ def prepare_deepspeed_plugin(args: argparse.Namespace):
             "lr": getattr(args, "unet_lr", args.learning_rate),
             "betas": [0.9, 0.999],
             "eps": 1e-08,
-            "weight_decay": 0.01,
+            "weight_decay": 0.1,
         }
     }
     #activation checkpointing
     if args.gradient_checkpointing:
-        logger.info("[DeepSpeed] Activating DeepSpeed's activation checkpointing (optimized for single GPU).")
+        logger.info("[DeepSpeed] Activating DeepSpeed's activation checkpointing")
         ds_config["activation_checkpointing"] = {
-            "partition_activations": False,  # False for single GPU low-VRAM training
+            "partition_activations": True if args.zero_stage == 3 else False,  # True for ZeRO-3 to partition across ranks
             "cpu_checkpointing": True,  # Offload activation checkpoints to CPU RAM
             "contiguous_memory_optimization": True,  # Reduce memory fragmentation
             "synchronize_checkpoint_boundary": False,
             "profile": False,
+            "number_checkpoints": None,  # Let DeepSpeed decide optimal checkpointing
         }
 
     if args.mixed_precision.lower() == "fp16":

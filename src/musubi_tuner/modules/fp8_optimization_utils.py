@@ -326,17 +326,13 @@ def fp8_linear_forward_patch(self: nn.Linear, x, use_scaled_mm=False, max_value=
         return o.reshape(original_shape[0], original_shape[1], -1).to(input_dtype)
 
     else:
-        # Dequantize the weight
-        original_dtype = self.scale_weight.dtype
-        dequantized_weight = self.weight.to(original_dtype) * self.scale_weight
-
-        # Perform linear transformation
-        if self.bias is not None:
-            output = F.linear(x, dequantized_weight, self.bias)
-        else:
-            output = F.linear(x, dequantized_weight)
-
-        return output
+        # Dequantize FP8 weight safely and compute in a supported dtype (bf16/float32)
+        compute_dtype = torch.bfloat16 if x.device.type == "cuda" else torch.float32
+        x_cast = x.to(compute_dtype)
+        dequantized_weight = self.weight.to(compute_dtype) * self.scale_weight.to(compute_dtype)
+        bias = self.bias.to(compute_dtype) if self.bias is not None else None
+        output = F.linear(x_cast, dequantized_weight, bias)
+        return output  # keep compute dtype to avoid re-casting to float8
 
 
 def apply_fp8_monkey_patch(model, optimized_state_dict, use_scaled_mm=False):
@@ -374,8 +370,8 @@ def apply_fp8_monkey_patch(model, optimized_state_dict, use_scaled_mm=False):
 
         # Apply patch if it's a Linear layer with FP8 scale
         if isinstance(module, nn.Linear) and has_scale:
-            # register the scale_weight as a buffer to load the state_dict
-            module.register_buffer("scale_weight", torch.tensor(1.0, dtype=module.weight.dtype))
+            # register the scale_weight as a FP32 buffer (avoids float8 arithmetic during dequant)
+            module.register_buffer("scale_weight", torch.tensor(1.0, dtype=torch.float32, device=module.weight.device))
 
             # Create a new forward method with the patched version.
             def new_forward(self, x):

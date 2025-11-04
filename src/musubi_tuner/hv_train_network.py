@@ -583,6 +583,8 @@ class NetworkTrainer:
         if self.is_schedulefree_optimizer(optimizer, args):
             return self.get_dummy_scheduler(optimizer)
 
+        # Note: When using DeepSpeed with DummyOptim, we still create a real scheduler
+        # DeepSpeed will use the scheduler configuration but manage it internally
         name = args.lr_scheduler
         num_training_steps = args.max_train_steps * num_processes  # * args.gradient_accumulation_steps
         num_warmup_steps: Optional[int] = (
@@ -1971,10 +1973,26 @@ class NetworkTrainer:
         # prepare optimizer, data loader etc.
         accelerator.print("prepare optimizer, data loader etc.")
 
+        # Check if using DeepSpeed
+        using_deepspeed = accelerator.state.distributed_type == accelerate.DistributedType.DEEPSPEED
+
         trainable_params, lr_descriptions = network.prepare_optimizer_params(transformer, unet_lr=args.learning_rate)
-        optimizer_name, optimizer_args, optimizer, optimizer_train_fn, optimizer_eval_fn = self.get_optimizer(
-            args, trainable_params
-        )
+
+        if using_deepspeed:
+            # When using DeepSpeed, use DummyOptim instead of real optimizer
+            # DeepSpeed manages the optimizer internally based on the config file
+            from accelerate.utils import DummyOptim, DummyScheduler
+
+            logger.info("Using DeepSpeed DummyOptim - optimizer will be managed by DeepSpeed")
+            optimizer = DummyOptim(trainable_params, lr=args.learning_rate)
+            optimizer_name = "DeepSpeedCPUAdam"  # or whatever is in the config
+            optimizer_args = "managed_by_deepspeed"
+            optimizer_train_fn = lambda: None
+            optimizer_eval_fn = lambda: None
+        else:
+            optimizer_name, optimizer_args, optimizer, optimizer_train_fn, optimizer_eval_fn = self.get_optimizer(
+                args, trainable_params
+            )
 
         # prepare dataloader
 
@@ -2002,8 +2020,18 @@ class NetworkTrainer:
         # send max_train_steps to train_dataset_group
         train_dataset_group.set_max_train_steps(args.max_train_steps)
 
-        # prepare lr_scheduler
-        lr_scheduler = self.get_lr_scheduler(args, optimizer, accelerator.num_processes)
+        # Check if DeepSpeed optimizer is in the config
+        # If so, we need to create the scheduler AFTER accelerator.prepare()
+        using_deepspeed = accelerator.state.distributed_type == accelerate.DistributedType.DEEPSPEED
+        has_deepspeed_optimizer = (
+            using_deepspeed
+            and accelerator.state.deepspeed_plugin is not None
+            and "optimizer" in accelerator.state.deepspeed_plugin.deepspeed_config
+        )
+
+        # prepare lr_scheduler (only if not using DeepSpeed optimizer, otherwise we'll create it after prepare)
+        if not has_deepspeed_optimizer:
+            lr_scheduler = self.get_lr_scheduler(args, optimizer, accelerator.num_processes)
 
         # prepare training model. accelerator does some magic here
 
@@ -2029,24 +2057,60 @@ class NetworkTrainer:
             logger.info(f"casting model to {dit_weight_dtype}")
             transformer.to(dit_weight_dtype)
 
-        # Check if using DeepSpeed
-        using_deepspeed = accelerator.state.distributed_type == accelerate.DistributedType.DEEPSPEED
+        # Check if using DeepSpeed (already checked above, but keeping for clarity)
+        # using_deepspeed and has_deepspeed_optimizer are already set above
 
-        if blocks_to_swap > 0:
-            if using_deepspeed:
-                logger.warning("blocks_to_swap is not compatible with DeepSpeed, disabling block swapping")
-                blocks_to_swap = 0
-                self.blocks_to_swap = 0
-                transformer = accelerator.prepare(transformer)
+        if blocks_to_swap > 0 and using_deepspeed:
+            logger.warning("blocks_to_swap is not compatible with DeepSpeed, disabling block swapping")
+            blocks_to_swap = 0
+            self.blocks_to_swap = 0
+
+        # Handle model preparation differently for DeepSpeed vs normal training
+        if using_deepspeed:
+            logger.info("Wrapping models for DeepSpeed training.")
+            from musubi_tuner.utils import deepspeed_utils
+
+            # We wrap the main model (transformer) and the trainable network (LoRA) together.
+            ds_model = deepspeed_utils.prepare_deepspeed_model(
+                args,
+                transformer=transformer,
+                network=network,
+            )
+
+            # Prepare the wrapped model and optimizer (and dataloader). The scheduler is prepared separately.
+            if has_deepspeed_optimizer:
+                logger.info("DeepSpeed optimizer detected - preparing wrapped model without scheduler first")
+                ds_model, optimizer, train_dataloader = accelerator.prepare(
+                    ds_model, optimizer, train_dataloader
+                )
+                # Now create and prepare the scheduler with the real DeepSpeed optimizer
+                logger.info("Creating LR scheduler with real DeepSpeed optimizer")
+                lr_scheduler = self.get_lr_scheduler(args, optimizer, accelerator.num_processes)
+                lr_scheduler = accelerator.prepare(lr_scheduler)
             else:
+                logger.info("Preparing wrapped model with scheduler")
+                ds_model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+                    ds_model, optimizer, train_dataloader, lr_scheduler
+                )
+
+            # After prepare, unwrap the models we need to pass to other functions
+            transformer = ds_model.models.transformer
+            network = ds_model.models.network
+
+            training_model = ds_model  # The entire wrapped model is the training target
+        else:
+            # Non-DeepSpeed path: handle blocks_to_swap and normal preparation
+            if blocks_to_swap > 0:
                 transformer = accelerator.prepare(transformer, device_placement=[not blocks_to_swap > 0])
                 accelerator.unwrap_model(transformer).move_to_device_except_swap_blocks(accelerator.device)  # reduce peak memory usage
                 accelerator.unwrap_model(transformer).prepare_block_swap_before_forward()
-        else:
-            transformer = accelerator.prepare(transformer)
+            else:
+                transformer = accelerator.prepare(transformer)
 
-        network, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(network, optimizer, train_dataloader, lr_scheduler)
-        training_model = network
+            # Normal case: prepare everything together
+            network, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(network, optimizer, train_dataloader, lr_scheduler)
+
+            training_model = network
 
         if args.gradient_checkpointing:
             transformer.train()
